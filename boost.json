@@ -1,0 +1,17 @@
+{
+    "agents": [
+        "opencode"
+    ],
+    "skills": [
+        "pest-testing",
+        "tailwindcss-development",
+        "eloquent-best-practices",
+        "laravel-11-12-app-guidelines",
+        "laravel-best-practices",
+        "laravel-specialist",
+        "laravel-tdd",
+        "laravel-testing",
+        "php-best-practices",
+        "php-pro"
+    ]
+}
