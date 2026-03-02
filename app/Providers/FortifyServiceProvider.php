@@ -38,13 +38,16 @@ final class FortifyServiceProvider extends ServiceProvider
         Fortify::redirectUserForTwoFactorAuthenticationUsing(RedirectIfTwoFactorAuthenticatable::class);
 
         RateLimiter::for('login', function (Request $request) {
-            $throttleKey = Str::transliterate(Str::lower($request->input(Fortify::username())).'|'.$request->ip());
+            $username = $request->input(Fortify::username());
+            $throttleKey = Str::transliterate(Str::lower(is_string($username) ? $username : '').'|'.$request->ip());
 
             return Limit::perMinute(5)->by($throttleKey);
         });
 
         RateLimiter::for('two-factor', function (Request $request) {
-            return Limit::perMinute(5)->by($request->session()->get('login.id'));
+            $loginId = $request->session()->get('login.id');
+
+            return Limit::perMinute(5)->by(is_int($loginId) || is_string($loginId) ? (string) $loginId : '');
         });
     }
 }
