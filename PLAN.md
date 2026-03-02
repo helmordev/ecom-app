@@ -5,15 +5,16 @@
 
 ## Tech Stack
 
-| Layer          | Technology                           |
-| -------------- | ------------------------------------ |
-| Backend        | Laravel 12, PHP 8.5                  |
-| Authentication | Laravel Fortify                      |
-| Frontend       | Blade + Livewire + Tailwind CSS v4   |
-| Real-time      | Laravel Broadcasting (Reverb) + Echo |
-| Database       | SQLite (MVP)                         |
-| Testing        | Pest v4                              |
-| Payment        | Cash on Delivery (MVP)               |
+| Layer          | Technology                                        |
+| -------------- | ------------------------------------------------- |
+| Backend        | Laravel 12, PHP 8.5                               |
+| Authentication | Laravel Fortify                                   |
+| Frontend       | Blade + Livewire + Tailwind CSS v4                |
+| Real-time      | Laravel Broadcasting (Reverb) + Echo              |
+| Database       | SQLite (MVP)                                      |
+| Testing        | Pest v4                                           |
+| Payment        | Polar.sh (digital) + Cash on Delivery (COD)       |
+| Payment SDK    | `danestves/laravel-polar` (Laravel Polar adapter) |
 
 ---
 
@@ -46,8 +47,8 @@ Roles are stored as a `UserRole` enum column on the `users` table.
 - Browse restaurants (search, filter by active/open)
 - View restaurant menu organized by category
 - Cart management (add items, update quantity, remove, clear)
-- Checkout page with delivery address selection and order notes
-- Place order (creates order from cart)
+- Checkout page with delivery address selection, payment method choice (Polar / COD), and order notes
+- Place order (creates order from cart; redirects to Polar checkout or proceeds directly for COD)
 - Real-time order status tracking
 - View order history
 - Leave reviews (restaurant rating + driver rating)
@@ -66,7 +67,6 @@ Roles are stored as a `UserRole` enum column on the `users` table.
 
 ### Future Enhancements (Out of MVP Scope)
 
-- Payment gateway integration (Stripe, PayPal)
 - Driver earnings tracking and commission system
 - Restaurant owner role (self-managed restaurants)
 - Promo codes and discount system
@@ -243,8 +243,10 @@ DriverProfile
 | subtotal                | decimal(10,2) |                                         |
 | delivery_fee            | decimal(8,2)  |                                         |
 | total                   | decimal(10,2) |                                         |
-| payment_method          | enum          | cash_on_delivery (MVP)                  |
+| payment_method          | enum          | cash_on_delivery, polar                 |
 | payment_status          | enum          | pending, paid, failed, refunded         |
+| polar_checkout_id       | string        | Nullable, Polar checkout session ID     |
+| polar_order_id          | string        | Nullable, Polar order ID                |
 | notes                   | text          | Nullable, customer notes                |
 | estimated_delivery_at   | timestamp     | Nullable                                |
 | delivered_at            | timestamp     | Nullable                                |
@@ -298,9 +300,101 @@ DriverProfile
 | --------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `UserRole`      | `Admin`, `User`, `Driver`                                                                                           |
 | `OrderStatus`   | `Pending`, `Confirmed`, `Preparing`, `ReadyForPickup`, `Assigned`, `PickedUp`, `OnTheWay`, `Delivered`, `Cancelled` |
-| `PaymentMethod` | `CashOnDelivery`                                                                                                    |
+| `PaymentMethod` | `CashOnDelivery`, `Polar`                                                                                           |
 | `PaymentStatus` | `Pending`, `Paid`, `Failed`, `Refunded`                                                                             |
 | `VehicleType`   | `Bicycle`, `Motorcycle`, `Car`                                                                                      |
+
+---
+
+## Payment Integration
+
+The application supports two payment methods. The customer chooses at checkout.
+
+### Payment Methods Overview
+
+| Method               | How It Works                                                                                          | Payment Status Flow           |
+| -------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------- |
+| **Polar.sh**         | Customer is redirected to Polar's hosted checkout (or embedded checkout). Webhook confirms payment.   | Pending -> Paid (via webhook) |
+| **Cash on Delivery** | No online payment. Driver collects cash upon delivery. Driver marks payment as collected on delivery. | Pending -> Paid (on delivery) |
+
+### Polar.sh Integration (Digital Payment)
+
+**Package:** `danestves/laravel-polar`
+
+**Setup:**
+
+1. Install via `composer require danestves/laravel-polar`
+2. Run `php artisan polar:install` (publishes config, migrations, views)
+3. Add `Billable` trait to the `User` model
+4. Configure `.env` with `POLAR_ACCESS_TOKEN` and `POLAR_WEBHOOK_SECRET`
+5. Exclude `polar/*` from CSRF verification in `bootstrap/app.php`
+6. Register webhook endpoint in Polar dashboard pointing to `{APP_URL}/polar/webhook`
+
+**Environment Variables:**
+
+```
+POLAR_ACCESS_TOKEN=<your_access_token>
+POLAR_WEBHOOK_SECRET=<your_webhook_secret>
+POLAR_PATH=polar
+```
+
+**Checkout Flow (Polar):**
+
+```
+Customer selects "Pay Online" at checkout
+  -> App creates an internal Order (status: PENDING, payment_status: PENDING, payment_method: POLAR)
+  -> App calls $user->checkout(['product_id'])
+       ->withMetadata(['order_id' => $order->id])
+       ->withSuccessUrl(route('customer.orders.show', $order) . '?checkout_id={CHECKOUT_ID}')
+  -> Customer is redirected to Polar's hosted checkout page
+  -> Customer completes payment on Polar
+  -> Polar sends `order.created` webhook to {APP_URL}/polar/webhook
+  -> App webhook listener matches metadata.order_id to internal Order
+  -> App updates Order: payment_status -> PAID, stores polar_checkout_id and polar_order_id
+  -> App dispatches OrderPaid event
+  -> Normal order lifecycle continues (Admin confirms, prepares, etc.)
+```
+
+**Webhook Events to Handle:**
+
+| Polar Event     | App Action                                                       |
+| --------------- | ---------------------------------------------------------------- |
+| `order.created` | Match to internal order via metadata, set payment_status to Paid |
+| `order.updated` | Handle refunds if applicable, set payment_status to Refunded     |
+
+**Embedded Checkout (Alternative):**
+
+- Include `@polarEmbedScript` in the `<head>` of the checkout layout
+- Use `<x-polar-button :checkout="$checkout" />` Blade component for in-page checkout
+- Avoids full redirect; customer stays on the app
+
+**Sandbox vs Production:**
+
+- Use Polar sandbox (`sandbox.polar.sh`) during development and testing
+- Use `polar listen http://localhost:8000/` CLI for local webhook testing
+- Switch to production tokens for deployment
+
+### Cash on Delivery (COD) Integration
+
+**Flow:**
+
+```
+Customer selects "Cash on Delivery" at checkout
+  -> App creates an internal Order (status: PENDING, payment_status: PENDING, payment_method: COD)
+  -> No external payment step; order proceeds directly into the order lifecycle
+  -> Admin confirms order -> Driver assigned -> Driver picks up -> Driver delivers
+  -> Driver marks delivery as complete
+  -> App automatically sets payment_status -> PAID (COD collected)
+  -> OrderDelivered event dispatched
+```
+
+**COD-Specific Rules:**
+
+- No upfront payment is required; the order enters the lifecycle immediately
+- The driver collects the exact `total` amount in cash upon delivery
+- Payment status transitions to `Paid` only when the order status reaches `Delivered`
+- If the order is cancelled before delivery, payment_status stays `Pending` (no money exchanged)
+- Admin dashboard shows COD orders with a distinct badge so staff can track cash collection
 
 ---
 
@@ -310,8 +404,15 @@ DriverProfile
 
 ```
 Customer places order (from cart -> checkout -> confirm)
-  -> Order status: PENDING
-  -> Event: OrderPlaced (Admin notified via broadcast)
+  -> If payment_method == POLAR:
+       -> Customer is redirected to Polar checkout
+       -> Polar webhook confirms payment (payment_status: PAID)
+       -> Order status: PENDING
+       -> Event: OrderPlaced (Admin notified via broadcast)
+  -> If payment_method == COD:
+       -> No external payment step
+       -> Order status: PENDING
+       -> Event: OrderPlaced (Admin notified via broadcast)
 
 Admin confirms order
   -> Order status: CONFIRMED
@@ -337,7 +438,7 @@ Driver en route to customer
 
 Driver completes delivery
   -> Order status: DELIVERED
-  -> Payment status: PAID (COD collected)
+  -> If payment_method == COD: payment_status -> PAID (cash collected)
   -> Event: OrderStatusUpdated (Customer prompted to review)
 ```
 
@@ -382,6 +483,7 @@ Order marked READY_FOR_PICKUP
 | ----------------------- | --------------------------- | ------------------------- | --------------------------- |
 | `OrderPlaced`           | `private-admin-orders`      | order details             | Admin dashboard             |
 | `OrderStatusUpdated`    | `private-orders.{orderId}`  | order, new status         | Customer tracking page      |
+| `OrderPaid`             | `private-orders.{orderId}`  | order, payment method     | Customer tracking page      |
 | `DriverLocationUpdated` | `private-orders.{orderId}`  | latitude, longitude       | Customer map                |
 | `NewDeliveryAvailable`  | `private-drivers`           | order summary             | Available drivers dashboard |
 | `OrderAssignedToDriver` | `private-driver.{driverId}` | order, restaurant details | Specific driver             |
@@ -415,6 +517,9 @@ app/
 │   │   ├── CancelOrder.php
 │   │   ├── UpdateOrderStatus.php
 │   │   └── AssignDriverToOrder.php
+│   ├── Payment/
+│   │   ├── CreatePolarCheckout.php
+│   │   └── HandlePolarWebhook.php
 │   ├── Driver/
 │   │   ├── AcceptDelivery.php
 │   │   ├── UpdateDriverLocation.php
@@ -433,6 +538,7 @@ app/
 ├── Events/
 │   ├── OrderPlaced.php
 │   ├── OrderStatusUpdated.php
+│   ├── OrderPaid.php
 │   ├── DriverLocationUpdated.php
 │   ├── NewDeliveryAvailable.php
 │   └── OrderAssignedToDriver.php
@@ -477,6 +583,9 @@ app/
 │       └── Driver/
 │           └── UpdateLocationRequest.php
 │
+├── Listeners/
+│   └── HandlePolarWebhookEvent.php
+│
 ├── Livewire/
 │   ├── Cart.php
 │   ├── OrderTracker.php
@@ -518,6 +627,7 @@ app/
 └── Services/
     ├── CartService.php
     ├── OrderService.php
+    ├── PaymentService.php
     └── DeliveryService.php
 
 resources/
@@ -527,7 +637,7 @@ resources/
 │   └── app.js
 └── views/
     ├── layouts/
-    │   ├── app.blade.php              (Customer layout)
+    │   ├── app.blade.php              (Customer layout, includes @polarEmbedScript)
     │   ├── admin.blade.php            (Admin layout)
     │   ├── driver.blade.php           (Driver layout)
     │   └── guest.blade.php            (Unauthenticated layout)
@@ -634,11 +744,12 @@ POST      /email/verification-notification  Resend verification
 
 ```
 GET     /cart                           View cart (Livewire component)
-GET     /checkout                       Checkout page (address selection, notes, confirm)
-POST    /orders                         Place order (from checkout)
+GET     /checkout                       Checkout page (address, payment method, notes, confirm)
+POST    /orders                         Place order (from checkout, handles both Polar and COD)
 
 GET     /orders                         Order history
 GET     /orders/{order}                 Track order (Livewire order tracker)
+GET     /orders/{order}/payment-success Payment success callback (Polar redirect-back)
 POST    /orders/{order}/review          Submit review
 
 GET     /addresses                      List saved addresses
@@ -704,6 +815,12 @@ GET     /driver/profile                 View profile
 PUT     /driver/profile                 Update profile
 ```
 
+### Webhook Routes (no auth, signature-verified)
+
+```
+POST    /polar/webhook                  Polar webhook endpoint (handled by laravel-polar package)
+```
+
 ---
 
 ## Services
@@ -712,6 +829,7 @@ PUT     /driver/profile                 Update profile
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CartService`     | Session-based cart management. Add/remove items, calculate totals, clear cart. Scoped per restaurant (switching restaurant clears the cart with a warning). |
 | `OrderService`    | Order lifecycle management. Creates order from cart, validates status transitions (see transition rules above), dispatches events on status change.         |
+| `PaymentService`  | Payment method orchestration. Creates Polar checkout sessions for digital payment. Handles COD payment marking on delivery. Updates payment_status.         |
 | `DeliveryService` | Driver assignment logic with DB-level locking to prevent race conditions. Delivery time estimation.                                                         |
 
 ---
@@ -737,6 +855,10 @@ PUT     /driver/profile                 Update profile
 ->withMiddleware(function (Middleware $middleware) {
     $middleware->alias([
         'role' => \App\Http\Middleware\EnsureUserHasRole::class,
+    ]);
+
+    $middleware->validateCsrfTokens(except: [
+        'polar/*',
     ]);
 })
 ```
@@ -769,6 +891,7 @@ tests/
 │   │   ├── Restaurant/
 │   │   ├── Menu/
 │   │   ├── Order/
+│   │   ├── Payment/
 │   │   ├── Driver/
 │   │   └── Review/
 │   ├── Http/
@@ -777,7 +900,8 @@ tests/
 │   │   └── Driver/
 │   ├── Livewire/
 │   ├── Middleware/
-│   └── Policies/
+│   ├── Policies/
+│   └── Webhooks/
 ├── Unit/
 │   ├── Models/
 │   ├── Enums/
@@ -795,6 +919,11 @@ tests/
 - Model relationship and scope tests
 - Broadcasting event structure and channel authorization tests
 - Middleware role-check tests (allowed, denied, unauthenticated)
-- Service class unit tests (CartService, OrderService, DeliveryService)
+- Service class unit tests (CartService, OrderService, PaymentService, DeliveryService)
 - Order status transition validation tests (valid + invalid transitions)
-- Factories with states: `unverified`, `admin`, `driver`, `available`, `verified`, `delivered`, `cancelled`, etc.
+- Payment flow tests:
+    - Polar checkout creation and redirect
+    - Polar webhook signature verification and payload handling
+    - COD payment status transition on delivery completion
+    - Payment method validation at checkout
+- Factories with states: `unverified`, `admin`, `driver`, `available`, `verified`, `delivered`, `cancelled`, `paid_with_polar`, `paid_with_cod`, etc.
